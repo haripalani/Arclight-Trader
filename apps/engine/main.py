@@ -23,12 +23,14 @@ from services.state_machine import state_machine, BotState
 from services.loss_tracker import loss_tracker
 from services.order_manager import order_manager
 from services.position_tracker import position_tracker
-from services.risk_manager import risk_manager
+from risk import risk_manager as new_risk_manager
+from services.risk_manager import risk_manager as exit_risk_manager
 from services.polymarket_adapter import polymarket_adapter
 from services.macro_service import macro_service
 import asyncio
 import httpx
-from datetime import datetime
+import signal
+from datetime import datetime, timezone
 
 app = FastAPI(title="Arclight Trading Engine")
 scheduler = AsyncIOScheduler()
@@ -58,6 +60,101 @@ latest_snapshot = {
         "arbitrage_detected": False
     }
 }
+
+# ─── Telegram Alerting ──────────────────────────────────────
+async def send_telegram_alert(message: str):
+    """Send a notification to Telegram if credentials are set."""
+    if not settings.telegram_bot_token or not settings.telegram_chat_id:
+        return
+    
+    try:
+        async with httpx.AsyncClient() as client:
+            await client.post(
+                f"https://api.telegram.org/bot{settings.telegram_bot_token}/sendMessage",
+                json={
+                    "chat_id": settings.telegram_chat_id,
+                    "text": f"🚨 *Arclight Alert*\n\n{message}",
+                    "parse_mode": "Markdown"
+                },
+                timeout=5.0
+            )
+    except Exception as e:
+        logger.warning(f"Failed to send Telegram alert: {e}")
+
+# ─── Graceful Shutdown ─────────────────────────────────────
+async def shutdown(sig, loop):
+    """Cancel all open orders and stop the engine."""
+    logger.info(f"Received exit signal {sig.name}...")
+    scheduler.shutdown()
+    
+    try:
+        client = await binance_client.get_client()
+        open_orders = await client.get_open_orders(symbol=settings.symbol)
+        if open_orders:
+            logger.info(f"Cancelling {len(open_orders)} open orders...")
+            for order in open_orders:
+                await client.cancel_order(symbol=settings.symbol, orderId=order['orderId'])
+    except Exception as e:
+        logger.error(f"Error during shutdown order cancellation: {e}")
+    
+    await send_telegram_alert("Engine shutdown complete. All orders cancelled.")
+    logger.info("Engine shutdown complete.")
+    loop.stop()
+
+# ─── Pre-flight Checks ─────────────────────────────────────
+async def pre_flight_checks():
+    """Verify all systems before starting."""
+    logger.info("Running Pre-flight checks...")
+    
+    # 1. Env variables
+    required_vars = [
+        ("BINANCE_API_KEY", settings.api_key),
+        ("BINANCE_API_SECRET", settings.api_secret),
+        ("SYSTEM_API_KEY", settings.system_api_key),
+        ("USER_ID", settings.user_id)
+    ]
+    for name, val in required_vars:
+        if not val:
+            logger.error(f"MISSING REQUIRED ENV: {name}")
+            sys.exit(1)
+
+    # 2. Live Trading Confirmation
+    if not settings.testnet and os.getenv("CONFIRM_LIVE_TRADING") != "yes":
+        print("\n" + "!"*60)
+        print("CRITICAL WARNING: BINANCE_TESTNET=false but CONFIRM_LIVE_TRADING != yes")
+        print("Trading on REAL FUNDS is disabled for safety.")
+        print("!"*60 + "\n")
+        sys.exit(1)
+
+    # 3. Redis Connectivity
+    from services.redis_client import redis_client
+    if not redis_client.client:
+        logger.error("REDIS UNREACHABLE or AUTH FAILED.")
+        sys.exit(1)
+
+    # 4. Binance Key permissions
+    try:
+        client = await binance_client.get_client()
+        status = await client.get_account_api_permissions()
+        if not status.get('enableSpotAndMarginTrading', False):
+            logger.error("BINANCE API KEY LACKS TRADING PERMISSIONS.")
+            sys.exit(1)
+    except Exception as e:
+        logger.error(f"BINANCE CONNECTIVITY FAILED: {e}")
+        sys.exit(1)
+
+    # 5. Mirofish Reachability
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(f"{settings.mirofish_url}/health", timeout=5.0)
+            if resp.status_code != 200:
+                logger.warning(f"MIROFISH ADAPTER HEALTHCHECK FAILED: {resp.status_code}")
+    except Exception as e:
+        logger.error(f"MIROFISH ADAPTER UNREACHABLE: {e}")
+        sys.exit(1)
+
+    logger.info("Pre-flight checks PASSED.")
+    await send_telegram_alert("Engine started and systems verified.")
 
 # ─── Recovery Logic ──────────────────────────────────────────
 async def startup_recovery():
@@ -138,7 +235,16 @@ async def trading_job():
                 if api_resp.status_code == 200:
                     profile_data = api_resp.json()
                     adjs = profile_data.get("strategyAdjustments") or {}
-                    evolution_bias = adjs.get("ml_alpha_bias", "HOLD")
+                    raw_bias = adjs.get("ml_alpha_bias", 0.0)
+                    
+                    # Phase 3: LLM Signal Validation
+                    try:
+                        # Ensure it's a number (clamp to [-1.0, 1.0])
+                        val = float(raw_bias)
+                        evolution_bias = max(-1.0, min(1.0, val))
+                    except (ValueError, TypeError):
+                        logger.warning(f"Invalid ml_alpha_bias received: {raw_bias}. Defaulting to 0.0")
+                        evolution_bias = 0.0
         except Exception as e:
             logger.debug(f"Could not fetch evolution profile: {e}")
 
@@ -188,9 +294,16 @@ async def trading_job():
                 )
                 # Sync logic... (omitted for brevity but kept in final implementation)
                 pnl = position_tracker.get_unrealized_pnl(last_price)
+                
                 # Record win/loss
                 if pnl > 0: loss_tracker.record_win()
                 else: loss_tracker.record_loss()
+                
+                # Phase 2: Record PnL in RiskManager
+                account = await binance_client.get_client().get_account()
+                balance = float(next(b['free'] for b in account['balances'] if b['asset'] == 'USDT'))
+                new_risk_manager.record_fill(pnl, balance)
+                new_risk_manager.open_positions_count -= 1
                 
                 position_tracker.close_position()
                 state_machine.on_trade_closed()
@@ -199,7 +312,7 @@ async def trading_job():
 
         # 3.5 Risk Management Exit (STOP LOSS / TRAILING STOP)
         if position_tracker.is_in_trade:
-            exit_reason = risk_manager.should_exit(position_tracker.current_position, last_price)
+            exit_reason = exit_risk_manager.should_exit(position_tracker.current_position, last_price)
             if exit_reason:
                 logger.info(f"RISK TRIGGER: {exit_reason} hit. Closing.")
                 await engine_logger.log("warn", f"Risk trigger: {exit_reason}")
@@ -210,6 +323,15 @@ async def trading_job():
                     position_tracker.current_position.quantity
                 )
                 
+                # Phase 2: Record PnL in RiskManager
+                pnl = position_tracker.get_unrealized_pnl(last_price)
+                account = await binance_client.get_client().get_account()
+                balance = float(next(b['free'] for b in account['balances'] if b['asset'] == 'USDT'))
+                new_risk_manager.record_fill(pnl, balance)
+                new_risk_manager.open_positions_count -= 1
+                
+                await send_telegram_alert(f"Trade Closed: {position_tracker.current_position.side} {settings.symbol} | PnL: ${pnl:.2f}")
+
                 position_tracker.close_position()
                 state_machine.on_trade_closed()
                 await push_status_to_api(latest_snapshot)
@@ -217,10 +339,18 @@ async def trading_job():
 
         # 4. Entry Logic
         if gate_open and not position_tracker.is_in_trade:
+            # Phase 2: Approve Trade
+            account = await binance_client.get_client().get_account()
+            balance = float(next(b['free'] for b in account['balances'] if b['asset'] == 'USDT'))
+
+            if not new_risk_manager.approve_trade(signal, settings.symbol, last_price, balance):
+                logger.warning(f"Engine Skip: RiskManager rejected trade for {settings.symbol}")
+                return
+
             state_machine.on_good_signal()
             logger.info(f"Gate OPEN → Signal: {signal}. Executing.")
-            
-            qty = risk_manager.calculate_position_size(100.0, last_price)
+
+            qty = exit_risk_manager.calculate_position_size(balance, last_price)
             order = await order_manager.place_market_order(
                 settings.symbol, 
                 "BUY" if signal == "BUY" else "SELL",
@@ -233,7 +363,9 @@ async def trading_job():
                     settings.symbol, entry_price, qty, 
                     "BUY" if signal == "BUY" else "SELL"
                 )
+                new_risk_manager.open_positions_count += 1
                 state_machine.on_trade_entered()
+                await send_telegram_alert(f"Trade Placed: {signal} {settings.symbol} @ ${entry_price:.2f}")
 
         # 5. Loss streak protection
         if loss_tracker.should_pause:
@@ -241,8 +373,12 @@ async def trading_job():
             logger.warning(pause_msg)
             latest_snapshot["state"] = BotState.PAUSED
             latest_snapshot["reason"] = pause_msg
+            await send_telegram_alert(f"Bot Paused: {pause_msg}")
             await push_status_to_api(latest_snapshot)
             return
+
+        if new_risk_manager.trading_halted:
+            await send_telegram_alert("DAILY DRAWDOWN LIMIT HIT — trading halted until midnight UTC.")
 
         await push_status_to_api(latest_snapshot)
 
@@ -291,7 +427,14 @@ async def polymarket_job():
 @app.on_event("startup")
 async def startup_event():
     logger.info("Arclight Trading Engine — Initializing...")
+    await pre_flight_checks()
     await startup_recovery()
+    
+    # Setup shutdown signals
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, lambda s=sig: asyncio.create_task(shutdown(s, loop)))
+
     scheduler.add_job(trading_job, 'interval', seconds=30, id="trading_job")
     scheduler.add_job(polymarket_job, 'interval', seconds=60, id="poly_job")
     scheduler.add_job(macro_service.fetch_all, 'interval', minutes=5, id="macro_job")
@@ -307,7 +450,13 @@ async def root():
 
 @app.get("/health")
 async def health():
-    return {"status": "healthy", "state": state_machine.state}
+    status = new_risk_manager.get_status()
+    return {
+        "status": "ok",
+        "trading_halted": status["trading_halted"],
+        "daily_pnl": status["daily_pnl"],
+        "open_positions": status["open_positions"]
+    }
 
 @app.get("/gate-status")
 async def gate_status():

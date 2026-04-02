@@ -8,9 +8,13 @@ class Settings(BaseSettings):
     
     api_url: str = os.getenv("API_URL", "http://localhost:9001")
     
-    # Check 05: Secrets Isolation
     system_api_key: str = os.getenv("SYSTEM_API_KEY", "")
     user_id: str = os.getenv("USER_ID", "") 
+    
+    # Redis
+    redis_host: str = os.getenv("REDIS_HOST", "redis")
+    redis_port: int = int(os.getenv("REDIS_PORT", 6379))
+    redis_password: str = os.getenv("REDIS_PASSWORD", "")
     
     # Phase 9: Real Trading
     binance_mode: str = os.getenv("BINANCE_MODE", "testnet") # "live" or "testnet"
@@ -21,6 +25,13 @@ class Settings(BaseSettings):
     
     fast_ema: int = 9
     slow_ema: int = 21
+
+    # Mirofish Adapter
+    mirofish_url: str = os.getenv("MIROFISH_URL", "http://mirofish:5000")
+
+    # Telegram
+    telegram_bot_token: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    telegram_chat_id: str = os.getenv("TELEGRAM_CHAT_ID", "")
 
     # --- ZERO-COST PRODUCTION KEYS ---
     groq_api_key: str = os.getenv("GROQ_API_KEY", "")
