@@ -1,0 +1,14 @@
+node_modules
+dist
+.next
+.git
+.env
+infra/postgres_data
+apps/web/node_modules
+apps/api/node_modules
+services/mirofish-adapter/backend/venv
+**/__pycache__
+**/*.pyc
+.idea
+.vscode
+*.log

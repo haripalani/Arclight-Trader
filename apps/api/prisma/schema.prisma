@@ -1,0 +1,162 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider      = "prisma-client-js"
+  binaryTargets = ["native", "linux-musl-openssl-3.0.x"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ==========================================
+// Authentication & Identity Models
+// ==========================================
+
+model User {
+  id            String    @id @default(uuid())
+  email         String    @unique
+  passwordHash  String
+  isVerified    Boolean   @default(false)
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  sessions      Session[]
+  botStates     BotState[]
+  tradeLogs     TradeLog[]
+  metrics       Metric[]
+  positions     Position[]
+  trades        Trade[]
+  skillProfiles SkillProfile[]
+  evolutionLogs EvolutionLog[]
+}
+
+model Session {
+  id        String   @id @default(uuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+}
+
+model VerificationToken {
+  id        String   @id @default(uuid())
+  email     String
+  token     String   @unique
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+  
+  @@unique([email, token])
+}
+
+model ResetToken {
+  id        String   @id @default(uuid())
+  email     String
+  token     String   @unique
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+  
+  @@unique([email, token])
+}
+
+// ==========================================
+// Trading & Engine Models
+// ==========================================
+
+enum BotStatus {
+  IDLE
+  TRADING
+  PAUSED
+}
+
+enum TradingMode {
+  PAPER
+  LIVE
+}
+
+model BotState {
+  id        String   @id @default(uuid())
+  userId    String   @unique
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  status    BotStatus @default(IDLE)
+  mode      TradingMode @default(PAPER)
+  updatedAt DateTime @updatedAt
+}
+
+model TradeLog {
+  id        String   @id @default(uuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  timestamp DateTime @default(now())
+  level     String   // info, warn, error, scan
+  message   String
+  metadata  Json?
+}
+
+model Metric {
+  id           String   @id @default(uuid())
+  userId       String   @unique
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  balance      Float    @default(100.0)
+  pnl          Float    @default(0.0)
+  winRate      Float    @default(0.0)
+  trades       Int      @default(0)
+  maxDrawdown  Float    @default(0.0)
+  sharpeRatio  Float    @default(0.0)
+  updatedAt    DateTime @updatedAt
+}
+
+model Position {
+  id          String   @id @default(uuid())
+  userId      String
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  symbol      String
+  entryPrice  Float
+  quantity    Float
+  stopLoss    Float?
+  takeProfit  Float?
+  side        String   // BUY or SELL
+  status      String   @default("OPEN") // OPEN, CLOSED
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+model Trade {
+  id          String   @id @default(uuid())
+  userId      String
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  symbol      String
+  entryPrice  Float
+  exitPrice   Float?
+  quantity    Float
+  pnl         Float?
+  side        String
+  status      String   @default("COMPLETED")
+  entryTime   DateTime @default(now())
+  exitTime    DateTime?
+}
+
+model SkillProfile {
+  id                String   @id @default(uuid())
+  userId            String   @unique
+  user              User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  lastUpdated       DateTime @updatedAt
+  technicalAnalysis Int      @default(50) // 0-100 score
+  riskManagement    Int      @default(50)
+  marketAdaptation  Int      @default(50)
+  strategyConfidence Float   @default(0.5)
+  notes             String   @default("Initial system state")
+  strategyAdjustments Json?  // Stores dynamic weights for symbols/indicators
+}
+
+model EvolutionLog {
+  id        String   @id @default(uuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  timestamp DateTime @default(now())
+  insight   String
+  action    String
+  metadata  Json?
+}
